@@ -1,13 +1,13 @@
 from pathlib import Path
+import math
 import os
 import secrets
 import shutil
 import sqlite3
 from typing import Optional
-from urllib.parse import urlencode
 
 import uvicorn
-from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile, status
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
@@ -17,19 +17,18 @@ BASE_DIR = Path(__file__).resolve().parent
 
 DB_PATH = BASE_DIR / "qr_collection.db"
 RAW_IMAGES_DIR = BASE_DIR / "raw_images"
+OUTPUT_HTML_DIR = BASE_DIR / "output_html"
 QR_CODES_DIR = BASE_DIR / "output_qr_codes"
 
 ADMIN_USERNAME = os.getenv("QR_ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.getenv("QR_ADMIN_PASSWORD", "admin321")
 
-DEFAULT_PAGE_SIZE = 25
-MAX_PAGE_SIZE = 100
+DEFAULT_PER_PAGE = 25
+MAX_PER_PAGE = 100
 
-# These are the fields the homepage knows how to display/search.
-# The app still supports raw Excel column names in the database.
-HOME_COLUMNS = [
-    "object_slug",
-    "image_filename",
+# Columns searched by the homepage filter. These names match the raw Excel
+# column names used by bulk_qr_code_generator.py.
+SEARCH_COLUMNS = [
     "OBJECTID",
     "ACCESSNO",
     "OBJNAME",
@@ -39,25 +38,13 @@ HOME_COLUMNS = [
     "COLLECTION",
     "DESCRIP",
 ]
-
-HOME_SEARCH_COLUMNS = [
-    "object_slug",
-    "OBJECTID",
-    "ACCESSNO",
-    "OBJNAME",
-    "DATE",
-    "MATERIAL",
-    "CONDITION",
-    "COLLECTION",
-    "DESCRIP",
-]
-
-# Make static directories exist before FastAPI mounts them.
-RAW_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
-QR_CODES_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="QR Collection")
 security = HTTPBasic()
+
+RAW_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+QR_CODES_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_HTML_DIR.mkdir(parents=True, exist_ok=True)
 
 app.mount(
     "/raw_images",
@@ -73,12 +60,14 @@ app.mount(
 
 
 def quote_identifier(name: str) -> str:
-    """Safely quote a SQLite table or column identifier."""
+    """
+    Safely quote a SQLite identifier while preserving raw Excel column names.
+    """
     safe_name = str(name).replace('"', '""')
     return f'"{safe_name}"'
 
 
-def get_db_connection() -> sqlite3.Connection:
+def get_db_connection():
     if not DB_PATH.exists():
         raise HTTPException(
             status_code=500,
@@ -90,7 +79,7 @@ def get_db_connection() -> sqlite3.Connection:
     return conn
 
 
-def require_admin(credentials: HTTPBasicCredentials = Depends(security)) -> str:
+def require_admin(credentials: HTTPBasicCredentials = Depends(security)):
     username_ok = secrets.compare_digest(credentials.username, ADMIN_USERNAME)
     password_ok = secrets.compare_digest(credentials.password, ADMIN_PASSWORD)
 
@@ -128,98 +117,101 @@ def html_escape(value: str) -> str:
     )
 
 
-def get_collection_columns() -> list[str]:
+def clamp_page(value: int) -> int:
+    if value < 1:
+        return 1
+    return value
+
+
+def clamp_per_page(value: int) -> int:
+    if value < 1:
+        return DEFAULT_PER_PAGE
+    if value > MAX_PER_PAGE:
+        return MAX_PER_PAGE
+    return value
+
+
+def get_available_columns() -> set[str]:
     conn = get_db_connection()
-    columns = conn.execute("PRAGMA table_info(collection_items)").fetchall()
+    columns = conn.execute(
+        """
+        PRAGMA table_info(collection_items)
+        """
+    ).fetchall()
     conn.close()
-    return [col["name"] for col in columns]
+
+    return {col["name"] for col in columns}
 
 
-def existing_columns(preferred_columns: list[str]) -> list[str]:
-    available = set(get_collection_columns())
-    return [col for col in preferred_columns if col in available]
-
-
-def build_home_where_clause(search_query: str, available_search_columns: list[str]) -> tuple[str, list[str]]:
+def build_home_where_clause(search_query: str, available_columns: set[str]) -> tuple[str, list[str]]:
     """
-    Builds a simple server-side search filter.
+    Builds a safe WHERE clause for homepage filtering.
 
-    q=blue searches selected homepage columns using SQLite LIKE.
-    Empty search returns all records.
+    The filter searches across common collection columns when those columns exist.
+    It does not interpolate user input into SQL. User input is always passed as a
+    bound parameter.
     """
     search_query = (search_query or "").strip()
 
     if not search_query:
         return "", []
 
-    like_value = f"%{search_query}%"
-    conditions = [f"{quote_identifier(col)} LIKE ?" for col in available_search_columns]
-    params = [like_value] * len(conditions)
+    searchable_columns = [col for col in SEARCH_COLUMNS if col in available_columns]
 
-    if not conditions:
+    if not searchable_columns:
         return "", []
+
+    like_value = f"%{search_query}%"
+    conditions = [f"COALESCE({quote_identifier(col)}, '') LIKE ?" for col in searchable_columns]
+    params = [like_value for _ in searchable_columns]
 
     return f"WHERE {' OR '.join(conditions)}", params
 
 
-def get_home_items(search_query: str = "", page: int = 1, per_page: int = DEFAULT_PAGE_SIZE) -> dict:
+def get_home_items(search_query: str = "", page: int = 1, per_page: int = DEFAULT_PER_PAGE) -> tuple[list[sqlite3.Row], int]:
     """
-    Returns one page of homepage rows instead of loading the full table.
+    Returns one page of homepage records plus the total number of matching rows.
 
-    This is the biggest scalability improvement. With a million records, the homepage
-    should fetch only 25/50/100 rows at a time, not all rows.
+    This avoids loading the full collection into memory and keeps the homepage
+    usable even when the database grows very large.
     """
-    page = max(1, int(page or 1))
-    per_page = max(1, min(int(per_page or DEFAULT_PAGE_SIZE), MAX_PAGE_SIZE))
+    page = clamp_page(page)
+    per_page = clamp_per_page(per_page)
     offset = (page - 1) * per_page
 
-    available_columns = existing_columns(HOME_COLUMNS)
-    available_search_columns = existing_columns(HOME_SEARCH_COLUMNS)
-
-    if not available_columns:
-        available_columns = ["*"]
-        select_sql = "*"
-    else:
-        select_sql = ", ".join(quote_identifier(col) for col in available_columns)
-
-    where_sql, where_params = build_home_where_clause(search_query, available_search_columns)
-
-    available_all_columns = set(get_collection_columns())
-    if "OBJECTID" in available_all_columns:
-        order_sql = "ORDER BY \"OBJECTID\" COLLATE NOCASE"
-    elif "id" in available_all_columns:
-        order_sql = "ORDER BY id"
-    else:
-        order_sql = ""
+    available_columns = get_available_columns()
+    where_clause, where_params = build_home_where_clause(search_query, available_columns)
 
     conn = get_db_connection()
 
-    count_sql = f"SELECT COUNT(*) AS total FROM collection_items {where_sql}"
-    total = conn.execute(count_sql, where_params).fetchone()["total"]
-
-    items_sql = f"""
-        SELECT {select_sql}
+    total = conn.execute(
+        f"""
+        SELECT COUNT(*) AS count
         FROM collection_items
-        {where_sql}
-        {order_sql}
+        {where_clause}
+        """,
+        where_params,
+    ).fetchone()["count"]
+
+    order_column = "OBJECTID" if "OBJECTID" in available_columns else "id"
+
+    items = conn.execute(
+        f"""
+        SELECT *
+        FROM collection_items
+        {where_clause}
+        ORDER BY {quote_identifier(order_column)}
         LIMIT ? OFFSET ?
-    """
-    items = conn.execute(items_sql, [*where_params, per_page, offset]).fetchall()
+        """,
+        where_params + [per_page, offset],
+    ).fetchall()
+
     conn.close()
 
-    total_pages = max(1, (total + per_page - 1) // per_page)
-
-    return {
-        "items": items,
-        "total": total,
-        "page": page,
-        "per_page": per_page,
-        "total_pages": total_pages,
-        "search_query": search_query,
-    }
+    return items, int(total)
 
 
-def get_item_by_slug(object_slug: str) -> Optional[sqlite3.Row]:
+def get_item_by_slug(object_slug: str):
     conn = get_db_connection()
     item = conn.execute(
         """
@@ -234,10 +226,24 @@ def get_item_by_slug(object_slug: str) -> Optional[sqlite3.Row]:
     return item
 
 
-def get_editable_columns() -> list[str]:
-    columns = get_collection_columns()
+def get_editable_columns():
+    conn = get_db_connection()
+    columns = conn.execute(
+        """
+        PRAGMA table_info(collection_items)
+        """
+    ).fetchall()
+    conn.close()
+
     excluded = {"id", "object_slug"}
-    return [col for col in columns if col not in excluded]
+
+    editable_columns = [
+        col["name"]
+        for col in columns
+        if col["name"] not in excluded
+    ]
+
+    return editable_columns
 
 
 def base_css() -> str:
@@ -333,11 +339,10 @@ def base_css() -> str:
             margin-bottom: 28px;
         }
 
-        .edit-button,
-        .small-link-button,
-        .cancel-button,
-        button {
+        .edit-button {
             display: inline-block;
+            margin-right: 8px;
+            margin-bottom: 28px;
             padding: 10px 16px;
             background-color: #4b3b2a;
             color: white;
@@ -345,37 +350,20 @@ def base_css() -> str:
             border-radius: 8px;
             font-size: 14px;
             border: 1px solid #b89b72;
-            cursor: pointer;
         }
 
-        .edit-button {
-            margin-right: 8px;
-            margin-bottom: 28px;
-        }
-
-        .small-link-button {
-            padding: 7px 10px;
-            font-size: 13px;
-            margin: 2px 0;
-        }
-
-        .edit-button:hover,
-        .small-link-button:hover,
-        .cancel-button:hover,
-        button:hover {
+        .edit-button:hover {
             background-color: #3b3025;
         }
 
-        .info-grid,
-        .form-grid {
+        .info-grid {
             display: grid;
             grid-template-columns: 180px 1fr;
             gap: 12px 16px;
             margin-bottom: 30px;
         }
 
-        .label,
-        label {
+        .label {
             font-weight: bold;
             color: #5c4a38;
         }
@@ -403,6 +391,18 @@ def base_css() -> str:
             line-height: 1.7;
         }
 
+        .form-grid {
+            display: grid;
+            grid-template-columns: 180px 1fr;
+            gap: 12px 16px;
+            margin-bottom: 30px;
+        }
+
+        label {
+            font-weight: bold;
+            color: #5c4a38;
+        }
+
         input,
         textarea,
         select {
@@ -414,6 +414,7 @@ def base_css() -> str:
             border-radius: 6px;
             color: #2f2a24;
             box-sizing: border-box;
+            background: white;
         }
 
         textarea {
@@ -426,6 +427,24 @@ def base_css() -> str:
             gap: 12px;
             margin-top: 20px;
             flex-wrap: wrap;
+        }
+
+        button,
+        .cancel-button {
+            display: inline-block;
+            padding: 10px 16px;
+            background-color: #4b3b2a;
+            color: white;
+            text-decoration: none;
+            border-radius: 8px;
+            font-size: 14px;
+            border: 1px solid #b89b72;
+            cursor: pointer;
+        }
+
+        button:hover,
+        .cancel-button:hover {
+            background-color: #3b3025;
         }
 
         footer {
@@ -463,13 +482,21 @@ def render_image_block(image_filename: str, object_id: str) -> str:
 
     if image_filename:
         image_url = f"/raw_images/{html_escape(image_filename)}"
-        return f'<img src="{image_url}" alt="{html_escape(object_id)} image">'
+        return f"""
+            <img src="{image_url}" alt="{html_escape(object_id)} image">
+        """
 
-    return '<div class="image-placeholder">No image assigned yet</div>'
+    return """
+        <div class="image-placeholder">
+            No image assigned yet
+        </div>
+    """
 
 
 def save_uploaded_image(uploaded_file: UploadFile, object_slug: str) -> str:
-    """Saves an uploaded image to raw_images/ and returns the saved filename."""
+    """
+    Saves an uploaded image to raw_images/ and returns the saved filename.
+    """
     if not uploaded_file or not uploaded_file.filename:
         return ""
 
@@ -495,63 +522,54 @@ def save_uploaded_image(uploaded_file: UploadFile, object_slug: str) -> str:
     return safe_filename
 
 
-def url_for_home(search_query: str = "", page: int = 1, per_page: int = DEFAULT_PAGE_SIZE) -> str:
-    params = {
-        "q": search_query or "",
-        "page": page,
-        "per_page": per_page,
-    }
-    return f"/?{urlencode(params)}"
+def render_pagination_controls(search_query: str, page: int, per_page: int, total_count: int) -> str:
+    total_pages = max(1, math.ceil(total_count / per_page))
+    page = min(max(1, page), total_pages)
 
+    query_value = html_escape(search_query)
 
-def render_pagination(search_query: str, page: int, per_page: int, total_pages: int, total: int) -> str:
-    prev_disabled = page <= 1
+    previous_page = page - 1
+    next_page = page + 1
+
+    previous_disabled = page <= 1
     next_disabled = page >= total_pages
 
-    prev_link = url_for_home(search_query, page - 1, per_page)
-    next_link = url_for_home(search_query, page + 1, per_page)
+    previous_href = f"/?q={query_value}&page={previous_page}&per_page={per_page}"
+    next_href = f"/?q={query_value}&page={next_page}&per_page={per_page}"
 
-    prev_html = (
-        '<span class="pagination-disabled">Previous</span>'
-        if prev_disabled
-        else f'<a class="pagination-link" href="{prev_link}">Previous</a>'
+    previous_html = (
+        '<span class="page-button disabled">Previous</span>'
+        if previous_disabled
+        else f'<a class="page-button" href="{previous_href}">Previous</a>'
     )
 
     next_html = (
-        '<span class="pagination-disabled">Next</span>'
+        '<span class="page-button disabled">Next</span>'
         if next_disabled
-        else f'<a class="pagination-link" href="{next_link}">Next</a>'
+        else f'<a class="page-button" href="{next_href}">Next</a>'
     )
 
     return f"""
         <div class="pagination-row">
             <div>
-                Showing page {page} of {total_pages} · {total} matching record(s)
+                Showing page <strong>{page}</strong> of <strong>{total_pages}</strong>
+                · <strong>{total_count}</strong> matching record(s)
             </div>
-            <div class="pagination-actions">
-                {prev_html}
+            <div class="pagination-buttons">
+                {previous_html}
                 {next_html}
             </div>
         </div>
     """
 
 
-def render_home_table(home_data: dict) -> str:
-    """
-    Renders the homepage table.
-
-    Important scalability change:
-    - The QR column does NOT use <img src="/qr_codes/...">.
-    - It only renders download/open links.
-    - That means the browser does not request QR PNGs for every row on page load.
-    """
-    items = home_data["items"]
-    search_query = home_data["search_query"]
-    page = home_data["page"]
-    per_page = home_data["per_page"]
-    total = home_data["total"]
-    total_pages = home_data["total_pages"]
-
+def render_home_table(
+    items: list[sqlite3.Row],
+    search_query: str = "",
+    page: int = 1,
+    per_page: int = DEFAULT_PER_PAGE,
+    total_count: int = 0,
+) -> str:
     rows_html = ""
 
     for item in items:
@@ -565,27 +583,37 @@ def render_home_table(home_data: dict) -> str:
         image_filename = safe_value(item, "image_filename")
 
         record_url = f"/item/{object_slug}"
-        qr_filename = f"{object_slug}_qr.png"
-        qr_url = f"/qr_codes/{qr_filename}"
 
         if image_filename:
+            image_url = f"/raw_images/{html_escape(image_filename)}"
             image_html = f"""
-                <a class="small-link-button" href="/raw_images/{html_escape(image_filename)}" target="_blank" rel="noopener">
-                    View Image
+                <a href="{image_url}" target="_blank" rel="noopener noreferrer">
+                    <img
+                        class="thumbnail"
+                        src="{image_url}"
+                        alt="{html_escape(object_id)} thumbnail"
+                        loading="lazy"
+                        decoding="async"
+                    >
                 </a>
             """
         else:
-            image_html = '<div class="thumbnail-placeholder">No Image</div>'
+            image_html = """
+                <div class="thumbnail-placeholder">No Image</div>
+            """
+
+        qr_filename = f"{object_slug}_qr.png"
+        qr_url = f"/qr_codes/{qr_filename}"
 
         rows_html += f"""
             <tr>
                 <td>{image_html}</td>
                 <td>
-                    <a class="small-link-button" href="{qr_url}" download>
+                    <a class="download-link" href="{qr_url}" download>
                         Download QR
                     </a>
                     <br>
-                    <a class="table-link" href="{qr_url}" target="_blank" rel="noopener">
+                    <a class="download-link" href="{qr_url}" target="_blank" rel="noopener noreferrer">
                         Open QR
                     </a>
                 </td>
@@ -596,9 +624,11 @@ def render_home_table(home_data: dict) -> str:
                 <td>{html_escape(material)}</td>
                 <td>{html_escape(condition)}</td>
                 <td>
-                    <a class="table-link" href="{record_url}">
-                        View Record
+                    <a class="record-link" href="{record_url}">
+                        Open Record
                     </a>
+                    <br>
+                    <span class="small-url">{html_escape(record_url)}</span>
                 </td>
             </tr>
         """
@@ -610,7 +640,14 @@ def render_home_table(home_data: dict) -> str:
             </tr>
         """
 
-    pagination_html = render_pagination(search_query, page, per_page, total_pages, total)
+    pagination_controls = render_pagination_controls(
+        search_query=search_query,
+        page=page,
+        per_page=per_page,
+        total_count=total_count,
+    )
+
+    search_query_escaped = html_escape(search_query)
 
     per_page_options = ""
     for option in [10, 25, 50, 100]:
@@ -645,24 +682,65 @@ def render_home_table(home_data: dict) -> str:
             margin-bottom: 28px;
         }}
 
-        .filter-box {{
-            margin-bottom: 24px;
+        .filter-form {{
+            display: grid;
+            grid-template-columns: 1fr 140px auto auto;
+            gap: 12px;
+            align-items: end;
+            margin-bottom: 22px;
             padding: 18px;
             background: #faf7f2;
             border: 1px solid #eadfce;
             border-radius: 10px;
         }}
 
-        .filter-form {{
-            display: grid;
-            grid-template-columns: 1fr 140px auto auto;
-            gap: 10px;
-            align-items: end;
-        }}
-
         .filter-field label {{
             display: block;
-            margin-bottom: 5px;
+            margin-bottom: 6px;
+        }}
+
+        .clear-link {{
+            display: inline-block;
+            padding: 10px 16px;
+            color: #4b3b2a;
+            font-weight: bold;
+            text-decoration: none;
+        }}
+
+        .clear-link:hover {{
+            text-decoration: underline;
+        }}
+
+        .pagination-row {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 16px;
+            margin: 18px 0;
+            flex-wrap: wrap;
+            color: #5c4a38;
+        }}
+
+        .pagination-buttons {{
+            display: flex;
+            gap: 8px;
+        }}
+
+        .page-button {{
+            display: inline-block;
+            padding: 8px 12px;
+            border-radius: 8px;
+            background: #4b3b2a;
+            color: white;
+            border: 1px solid #b89b72;
+            text-decoration: none;
+            font-size: 14px;
+        }}
+
+        .page-button.disabled {{
+            background: #d7c8b3;
+            color: #7a6a58;
+            cursor: not-allowed;
         }}
 
         table {{
@@ -689,9 +767,19 @@ def render_home_table(home_data: dict) -> str:
             background-color: #faf7f2;
         }}
 
+        .thumbnail {{
+            width: 75px;
+            height: 75px;
+            object-fit: cover;
+            border-radius: 8px;
+            border: 1px solid #d7c8b3;
+            box-shadow: 0 2px 6px rgba(0, 0, 0, 0.06);
+            background: white;
+        }}
+
         .thumbnail-placeholder {{
             width: 75px;
-            height: 40px;
+            height: 75px;
             border-radius: 8px;
             border: 1px dashed #d7c8b3;
             background: #faf7f2;
@@ -703,50 +791,31 @@ def render_home_table(home_data: dict) -> str:
             text-align: center;
         }}
 
-        .table-link {{
+        .record-link,
+        .download-link {{
             color: #4b3b2a;
             font-weight: bold;
             text-decoration: none;
+        }}
+
+        .download-link {{
+            display: inline-block;
+            margin-top: 3px;
+            margin-bottom: 3px;
             font-size: 13px;
         }}
 
-        .table-link:hover {{
+        .record-link:hover,
+        .download-link:hover {{
             text-decoration: underline;
         }}
 
-        .pagination-row {{
-            display: flex;
-            justify-content: space-between;
-            gap: 16px;
-            align-items: center;
-            margin: 18px 0;
-            color: #5c4a38;
-            flex-wrap: wrap;
-        }}
-
-        .pagination-actions {{
-            display: flex;
-            gap: 10px;
-            align-items: center;
-        }}
-
-        .pagination-link,
-        .pagination-disabled {{
+        .small-url {{
             display: inline-block;
-            padding: 8px 12px;
-            border-radius: 8px;
-            border: 1px solid #b89b72;
-            text-decoration: none;
-        }}
-
-        .pagination-link {{
-            background: #4b3b2a;
-            color: white;
-        }}
-
-        .pagination-disabled {{
-            background: #eee6da;
-            color: #9b8b7a;
+            margin-top: 4px;
+            color: #7a6a58;
+            font-size: 12px;
+            overflow-wrap: anywhere;
         }}
 
         @media (max-width: 900px) {{
@@ -767,35 +836,33 @@ def render_home_table(home_data: dict) -> str:
         <div class="table-container">
             <h2 class="records-title">All Collection Records</h2>
             <div class="records-subtitle">
-                Search records, open record pages, and download QR codes only when needed.
+                Search records, view image thumbnails, open record pages, or download QR codes.
             </div>
 
-            <div class="filter-box">
-                <form class="filter-form" method="get" action="/">
-                    <div class="filter-field">
-                        <label for="q">Filter records</label>
-                        <input
-                            id="q"
-                            name="q"
-                            value="{html_escape(search_query)}"
-                            placeholder="Search object ID, accession no., name, material, condition, description..."
-                        >
-                    </div>
+            <form class="filter-form" method="get" action="/">
+                <div class="filter-field">
+                    <label for="q">Search records</label>
+                    <input
+                        id="q"
+                        name="q"
+                        value="{search_query_escaped}"
+                        placeholder="Search Object ID, accession no., name, material, condition, description..."
+                    >
+                </div>
 
-                    <div class="filter-field">
-                        <label for="per_page">Rows per page</label>
-                        <select id="per_page" name="per_page">
-                            {per_page_options}
-                        </select>
-                    </div>
+                <div class="filter-field">
+                    <label for="per_page">Rows per page</label>
+                    <select id="per_page" name="per_page">
+                        {per_page_options}
+                    </select>
+                </div>
 
-                    <input type="hidden" name="page" value="1">
-                    <button type="submit">Search</button>
-                    <a class="cancel-button" href="/">Clear</a>
-                </form>
-            </div>
+                <input type="hidden" name="page" value="1">
+                <button type="submit">Filter</button>
+                <a class="clear-link" href="/">Clear</a>
+            </form>
 
-            {pagination_html}
+            {pagination_controls}
 
             <table>
                 <thead>
@@ -816,7 +883,7 @@ def render_home_table(home_data: dict) -> str:
                 </tbody>
             </table>
 
-            {pagination_html}
+            {pagination_controls}
         </div>
     </div>
 
@@ -1026,9 +1093,37 @@ def render_edit_page(item: sqlite3.Row) -> str:
 
 
 @app.get("/", response_class=HTMLResponse)
-def index(q: str = "", page: int = 1, per_page: int = DEFAULT_PAGE_SIZE):
-    home_data = get_home_items(search_query=q, page=page, per_page=per_page)
-    return HTMLResponse(render_home_table(home_data))
+def index(
+    q: str = Query("", description="Search/filter text"),
+    page: int = Query(1, ge=1),
+    per_page: int = Query(DEFAULT_PER_PAGE, ge=1, le=MAX_PER_PAGE),
+):
+    page = clamp_page(page)
+    per_page = clamp_per_page(per_page)
+
+    items, total_count = get_home_items(
+        search_query=q,
+        page=page,
+        per_page=per_page,
+    )
+
+    # If the user lands beyond the last page after filtering, redirect to the last valid page.
+    total_pages = max(1, math.ceil(total_count / per_page))
+    if page > total_pages:
+        return RedirectResponse(
+            url=f"/?q={html_escape(q)}&page={total_pages}&per_page={per_page}",
+            status_code=302,
+        )
+
+    return HTMLResponse(
+        render_home_table(
+            items=items,
+            search_query=q,
+            page=page,
+            per_page=per_page,
+            total_count=total_count,
+        )
+    )
 
 
 @app.get("/scan/{filename}", response_class=HTMLResponse)
@@ -1059,7 +1154,7 @@ def item_detail(object_slug: str):
 @app.get("/admin/edit/{object_slug}", response_class=HTMLResponse)
 def edit_item_page(
     object_slug: str,
-    admin_user: str = Depends(require_admin),
+    admin_user=Depends(require_admin),
 ):
     item = get_item_by_slug(object_slug)
 
@@ -1074,7 +1169,7 @@ async def update_item(
     request: Request,
     object_slug: str,
     uploaded_image: Optional[UploadFile] = File(None),
-    admin_user: str = Depends(require_admin),
+    admin_user=Depends(require_admin),
 ):
     item = get_item_by_slug(object_slug)
 
@@ -1097,11 +1192,14 @@ async def update_item(
 
     if uploaded_image and uploaded_image.filename:
         saved_image_filename = save_uploaded_image(uploaded_image, object_slug)
-        update_columns.append(f"{quote_identifier('image_filename')} = ?")
+        update_columns.append('"image_filename" = ?')
         update_values.append(saved_image_filename)
-    elif "image_filename" in editable_columns:
-        update_columns.append(f"{quote_identifier('image_filename')} = ?")
-        update_values.append(str(form_data.get("image_filename", "")))
+    else:
+        # Keep whatever image_filename was manually typed in the edit form.
+        # This lets you still edit the filename by hand if desired.
+        if "image_filename" in editable_columns:
+            update_columns.append('"image_filename" = ?')
+            update_values.append(str(form_data.get("image_filename", "")))
 
     if not update_columns:
         return RedirectResponse(url=f"/item/{object_slug}", status_code=303)

@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 import math
 import os
 import re
@@ -37,6 +38,48 @@ SEARCH_COLUMNS = [
     "COLLECTION",
     "DESCRIP",
 ]
+
+OBJECT_ID_PREFIXES = {
+    "201": "Bedding, Flat Textiles",
+    "202": "Household Accessory - Table Linens, Doilies, Pillowcases, etc.",
+    "301 A": "Aprons",
+    "301 B": "Lace Ribbon",
+    "301 C": "Umbrellas",
+    "301 D": "Jewelry",
+    "301 E": "Fringe, Trims",
+    "302 A": "Footwear, Female",
+    "302 B": "Footwear Children's",
+    "302 C": "Footwear, Male",
+    "302 D": "Footwear, Socks/Stockings",
+    "303 A": "Hats, Female",
+    "303 B": "Hats, Caps, Child's",
+    "303 C": "Hats Male",
+    "303 D": "Bonnets, Caps, Female",
+    "304 A": "Clothing Outerwear, Female",
+    "304 B": "Clothing Outerwear, Children's",
+    "304 C": "Clothing Outerwear, Male",
+    "305 A": "Clothing Underwear, Bra/Chemise/Corset Cover/Corsets",
+    "305 B": "Clothing Underwear, Petticoat/Half Slip/Slip",
+    "305 C": "Clothing Underwear, Teddy/Sets/Bed Jackets",
+    "305 D": "Clothing Underwear, Drawers-Female",
+    "305 DD": "Clothing Underwear, Drawers/Union Suits-Male",
+    "305 E": "Clothing Underwear, Gowns/Robes",
+    "305 F": "Swimwear, Female/Male",
+    "306 A": "Clothing Accessory, Purse/Muffs",
+    "306 B": "Clothing Accessory, Gloves",
+    "306 C": "Clothing Accessory, Combs/Hair Ornaments",
+    "306 D": "Clothing Accessory, Fans",
+    "306 E": "Clothing Accessory, Shawls/Stoles/Capelets",
+    "306 F": "Clothing Accessory, Collars/Dickies/Jabots-Female",
+    "306 G": "Clothing Accessory, Collars/Ties/Suspenders-Male",
+    "306 H": "Clothing Accessory, Scarves/Handkerchiefs-Female",
+    "306 I": "Clothing Accessory, Belt Buckles/Belts/Cummerbunds",
+    "307": "Personal Gear, e.g. Eye Glasses",
+    "309": "Toilet Articles, Perfume Bottles/Compacts/etc.",
+    "902": "Ceremonial Artifacts/Uniforms/Wedding Dresses",
+}
+
+FOOTWEAR_OBJECT_ID_PREFIXES = {"302 A", "302 B", "302 C", "302 D"}
 
 app = FastAPI(title="QR Collection")
 security = HTTPBasic()
@@ -242,15 +285,6 @@ def slugify(value: str) -> str:
 
 
 def build_base_slug_from_form(form_data) -> str:
-    """
-    Creates a usable object_slug for a new record.
-
-    Preference order:
-    1. OBJECTID
-    2. ACCESSNO
-    3. OBJNAME
-    4. generated record token
-    """
     for column in ["OBJECTID", "ACCESSNO", "OBJNAME"]:
         value = str(form_data.get(column, "")).strip()
         slug = slugify(value)
@@ -285,6 +319,160 @@ def make_unique_object_slug(base_slug: str) -> str:
 
         candidate = f"{base_slug}_{counter}"
         counter += 1
+
+
+def normalize_object_id_prefix(prefix: str) -> str:
+    prefix = str(prefix or "").strip().upper()
+    prefix = re.sub(r"\s+", " ", prefix)
+    return prefix
+
+
+def get_object_id_number_from_value(object_id: str, prefix: str) -> Optional[int]:
+    """
+    Parses OBJECTID values like:
+    302 C-0007
+    302 C-0007a
+    302 C-0007ab
+
+    Returns the numeric part only.
+    """
+    object_id = str(object_id or "").strip().upper()
+    prefix = normalize_object_id_prefix(prefix)
+
+    pattern = rf"^{re.escape(prefix)}-(\d{{1,10}})(?:A|AB)?$"
+    match = re.match(pattern, object_id)
+
+    if not match:
+        return None
+
+    return int(match.group(1))
+
+
+def get_next_object_id_number(prefix: str) -> int:
+    """
+    Finds the highest existing numeric value for a given OBJECTID prefix and
+    returns the next number.
+
+    Example:
+    Existing 302 C-0000 through 302 C-0008 -> returns 9.
+    """
+    prefix = normalize_object_id_prefix(prefix)
+
+    if prefix not in OBJECT_ID_PREFIXES:
+        raise HTTPException(status_code=400, detail="Invalid OBJECTID prefix.")
+
+    conn = get_db_connection()
+    rows = conn.execute(
+        """
+        SELECT OBJECTID
+        FROM collection_items
+        WHERE OBJECTID LIKE ?
+        """,
+        (f"{prefix}-%",),
+    ).fetchall()
+    conn.close()
+
+    max_number = -1
+
+    for row in rows:
+        number = get_object_id_number_from_value(safe_value(row, "OBJECTID"), prefix)
+        if number is not None and number > max_number:
+            max_number = number
+
+    return max_number + 1
+
+
+def build_object_id(prefix: str, object_number: int, paired_item: bool = False) -> str:
+    prefix = normalize_object_id_prefix(prefix)
+
+    if prefix not in OBJECT_ID_PREFIXES:
+        raise HTTPException(status_code=400, detail="Invalid OBJECTID prefix.")
+
+    suffix = ""
+
+    if prefix in FOOTWEAR_OBJECT_ID_PREFIXES:
+        suffix = "ab" if paired_item else "a"
+
+    return f"{prefix}-{object_number:04d}{suffix}"
+
+
+def object_id_exists(object_id: str) -> bool:
+    conn = get_db_connection()
+    existing = conn.execute(
+        """
+        SELECT 1
+        FROM collection_items
+        WHERE OBJECTID = ?
+        LIMIT 1
+        """,
+        (object_id,),
+    ).fetchone()
+    conn.close()
+
+    return existing is not None
+
+
+def build_create_object_id_from_form(form_data) -> str:
+    prefix = normalize_object_id_prefix(form_data.get("object_id_prefix", ""))
+
+    if prefix not in OBJECT_ID_PREFIXES:
+        raise HTTPException(status_code=400, detail="Please select a valid OBJECTID prefix.")
+
+    raw_number = str(form_data.get("object_id_number", "")).strip()
+
+    if not raw_number:
+        raise HTTPException(status_code=400, detail="OBJECTID number is required.")
+
+    if not raw_number.isdigit():
+        raise HTTPException(status_code=400, detail="OBJECTID number must contain digits only.")
+
+    requested_number = int(raw_number)
+    next_number = get_next_object_id_number(prefix)
+
+    if requested_number < next_number:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Invalid OBJECTID number. The next available number for {prefix} "
+                f"is {next_number:04d}. You may use {next_number:04d} or a larger number."
+            ),
+        )
+
+    paired_item = str(form_data.get("object_id_is_pair", "")).lower() in {"on", "true", "1", "yes"}
+
+    object_id = build_object_id(
+        prefix=prefix,
+        object_number=requested_number,
+        paired_item=paired_item,
+    )
+
+    if object_id_exists(object_id):
+        raise HTTPException(
+            status_code=400,
+            detail=f"OBJECTID {object_id} already exists. Please choose a larger number.",
+        )
+
+    return object_id
+
+
+def get_object_id_prefix_defaults() -> dict[str, dict[str, object]]:
+    defaults = {}
+
+    for prefix, label in OBJECT_ID_PREFIXES.items():
+        next_number = get_next_object_id_number(prefix)
+        defaults[prefix] = {
+            "label": label,
+            "nextNumber": next_number,
+            "nextNumberPadded": f"{next_number:04d}",
+            "defaultObjectId": build_object_id(
+                prefix=prefix,
+                object_number=next_number,
+                paired_item=False,
+            ),
+            "isFootwear": prefix in FOOTWEAR_OBJECT_ID_PREFIXES,
+        }
+
+    return defaults
 
 
 def base_css() -> str:
@@ -1163,12 +1351,177 @@ def render_edit_page(item: sqlite3.Row) -> str:
 """
 
 
+def render_create_object_id_builder() -> str:
+    prefix_defaults = get_object_id_prefix_defaults()
+    prefix_defaults_json = html_escape(json.dumps(prefix_defaults))
+
+    options_html = ""
+
+    for prefix, label in OBJECT_ID_PREFIXES.items():
+        options_html += f"""
+            <option value="{html_escape(prefix)}">
+                {html_escape(prefix)} : {html_escape(label)}
+            </option>
+        """
+
+    first_prefix = next(iter(OBJECT_ID_PREFIXES.keys()))
+    first_next_number = prefix_defaults[first_prefix]["nextNumber"]
+    first_default_object_id = prefix_defaults[first_prefix]["defaultObjectId"]
+
+    return f"""
+        <div class="object-id-builder">
+            <h3>OBJECTID</h3>
+            <p>
+                Select the object type prefix first. The system will suggest the next available OBJECTID
+                based on the existing records in the database.
+            </p>
+
+            <div class="object-id-grid">
+                <label for="object_id_prefix">OBJECTID Prefix</label>
+                <select id="object_id_prefix" name="object_id_prefix" required>
+                    {options_html}
+                </select>
+
+                <label for="object_id_number">OBJECTID Number</label>
+                <input
+                    id="object_id_number"
+                    name="object_id_number"
+                    value="{int(first_next_number):04d}"
+                    inputmode="numeric"
+                    pattern="[0-9]+"
+                    required
+                >
+
+                <label for="object_id_preview">Generated OBJECTID</label>
+                <input
+                    id="object_id_preview"
+                    name="OBJECTID"
+                    value="{html_escape(first_default_object_id)}"
+                    readonly
+                >
+
+                <div id="pair_label" class="pair-label">
+                    Footwear/Socks Pair
+                </div>
+
+                <div id="pair_controls" class="pair-controls">
+                    <label class="checkbox-label">
+                        <input id="object_id_is_pair" name="object_id_is_pair" type="checkbox">
+                        This record contains two shoes/socks. Append <strong>ab</strong>.
+                    </label>
+                    <div class="helper-text">
+                        Leave unchecked for a single shoe/sock. The OBJECTID will end in <strong>a</strong>.
+                    </div>
+                </div>
+            </div>
+
+            <div id="object_id_help" class="helper-text">
+                You may keep the suggested number or enter a larger custom number. You cannot use a number
+                lower than the current next available number for the selected prefix.
+            </div>
+        </div>
+
+        <script>
+            const objectIdPrefixData = JSON.parse("{prefix_defaults_json}".replaceAll("&quot;", '"'));
+            const footwearPrefixes = new Set({json.dumps(sorted(FOOTWEAR_OBJECT_ID_PREFIXES))});
+
+            const prefixSelect = document.getElementById("object_id_prefix");
+            const numberInput = document.getElementById("object_id_number");
+            const previewInput = document.getElementById("object_id_preview");
+            const pairCheckbox = document.getElementById("object_id_is_pair");
+            const pairLabel = document.getElementById("pair_label");
+            const pairControls = document.getElementById("pair_controls");
+            const objectIdHelp = document.getElementById("object_id_help");
+
+            function padNumber(value) {{
+                const numericValue = String(value || "").replace(/\\D/g, "");
+                if (!numericValue) {{
+                    return "";
+                }}
+                return numericValue.padStart(4, "0");
+            }}
+
+            function selectedPrefixIsFootwear() {{
+                return footwearPrefixes.has(prefixSelect.value);
+            }}
+
+            function buildObjectId() {{
+                const prefix = prefixSelect.value;
+                const number = padNumber(numberInput.value);
+
+                if (!number) {{
+                    previewInput.value = "";
+                    return;
+                }}
+
+                let suffix = "";
+
+                if (selectedPrefixIsFootwear()) {{
+                    suffix = pairCheckbox.checked ? "ab" : "a";
+                }}
+
+                previewInput.value = `${{prefix}}-${{number}}${{suffix}}`;
+            }}
+
+            function updatePairVisibility() {{
+                if (selectedPrefixIsFootwear()) {{
+                    pairLabel.style.display = "block";
+                    pairControls.style.display = "block";
+                }} else {{
+                    pairLabel.style.display = "none";
+                    pairControls.style.display = "none";
+                    pairCheckbox.checked = false;
+                }}
+            }}
+
+            function resetNumberForPrefix() {{
+                const prefix = prefixSelect.value;
+                const data = objectIdPrefixData[prefix];
+
+                if (!data) {{
+                    return;
+                }}
+
+                numberInput.value = String(data.nextNumberPadded);
+                updatePairVisibility();
+                buildObjectId();
+
+                objectIdHelp.innerHTML = `
+                    Next available number for <strong>${{prefix}}</strong> is
+                    <strong>${{data.nextNumberPadded}}</strong>. You may use this number or a larger number.
+                `;
+            }}
+
+            prefixSelect.addEventListener("change", resetNumberForPrefix);
+
+            numberInput.addEventListener("input", function () {{
+                numberInput.value = numberInput.value.replace(/\\D/g, "");
+                buildObjectId();
+            }});
+
+            numberInput.addEventListener("blur", function () {{
+                if (numberInput.value) {{
+                    numberInput.value = padNumber(numberInput.value);
+                }}
+                buildObjectId();
+            }});
+
+            pairCheckbox.addEventListener("change", buildObjectId);
+
+            resetNumberForPrefix();
+        </script>
+    """
+
+
 def render_create_page() -> str:
     editable_columns = get_editable_columns()
 
     form_fields_html = ""
 
     for column in editable_columns:
+        if column == "OBJECTID":
+            continue
+
         if column == "DESCRIP":
             form_fields_html += f"""
                 <label for="{html_escape(column)}">{html_escape(column)}</label>
@@ -1181,6 +1534,7 @@ def render_create_page() -> str:
             """
 
     image_block = render_image_block("", "New Record")
+    object_id_builder = render_create_object_id_builder()
 
     image_upload_html = """
         <div class="description-box">
@@ -1207,7 +1561,66 @@ def render_create_page() -> str:
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Create New Record</title>
-    <style>{base_css()}</style>
+    <style>
+        {base_css()}
+
+        .object-id-builder {{
+            margin-bottom: 30px;
+            padding: 20px;
+            background-color: #faf7f2;
+            border: 1px solid #eadfce;
+            border-left: 5px solid #b89b72;
+            border-radius: 10px;
+        }}
+
+        .object-id-builder h3 {{
+            margin-top: 0;
+            color: #4b3b2a;
+        }}
+
+        .object-id-builder p {{
+            color: #5c4a38;
+            line-height: 1.6;
+        }}
+
+        .object-id-grid {{
+            display: grid;
+            grid-template-columns: 180px 1fr;
+            gap: 12px 16px;
+            align-items: center;
+        }}
+
+        .checkbox-label {{
+            display: flex;
+            gap: 8px;
+            align-items: flex-start;
+            font-weight: normal;
+            color: #2f2a24;
+        }}
+
+        .checkbox-label input {{
+            width: auto;
+            margin-top: 3px;
+        }}
+
+        .helper-text {{
+            margin-top: 8px;
+            color: #7a6a58;
+            font-size: 13px;
+            line-height: 1.5;
+        }}
+
+        #object_id_preview {{
+            background-color: #f3ede4;
+            font-weight: bold;
+        }}
+
+        @media (max-width: 900px) {{
+            .object-id-grid {{
+                grid-template-columns: 1fr;
+            }}
+        }}
+    </style>
 </head>
 <body>
 
@@ -1225,10 +1638,12 @@ def render_create_page() -> str:
             <div class="details-section">
                 <h2 class="item-title">Create New Record</h2>
                 <div class="item-subtitle">
-                    Enter the collection item details below. The record will be saved to qr_collection.db.
+                    Start with the OBJECTID prefix. The database will determine the next valid number.
                 </div>
 
                 <form method="post" action="/admin/create" enctype="multipart/form-data">
+                    {object_id_builder}
+
                     <div class="form-grid">
                         {form_fields_html}
                     </div>
@@ -1394,7 +1809,12 @@ async def create_item(
     editable_columns = get_editable_columns()
     form_data = await request.form()
 
-    base_slug = build_base_slug_from_form(form_data)
+    generated_object_id = build_create_object_id_from_form(form_data)
+
+    form_data_dict = dict(form_data)
+    form_data_dict["OBJECTID"] = generated_object_id
+
+    base_slug = build_base_slug_from_form(form_data_dict)
     object_slug = make_unique_object_slug(base_slug)
 
     insert_columns = ["object_slug"]
@@ -1404,8 +1824,12 @@ async def create_item(
         if column == "image_filename":
             continue
 
-        insert_columns.append(column)
-        insert_values.append(str(form_data.get(column, "")))
+        if column == "OBJECTID":
+            insert_columns.append(column)
+            insert_values.append(generated_object_id)
+        else:
+            insert_columns.append(column)
+            insert_values.append(str(form_data.get(column, "")))
 
     if "image_filename" in editable_columns:
         if uploaded_image and uploaded_image.filename:

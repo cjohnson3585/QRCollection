@@ -1,6 +1,6 @@
 from pathlib import Path
 import re
-
+from typing import Optional
 import qrcode
 
 
@@ -85,7 +85,7 @@ def generate_qr_code_for_record(
     object_slug: str,
     base_url: str,
     output_qr_dir: Path,
-    output_html_dir: Path | None = None,
+    output_html_dir: Optional[Path] = None,
 ) -> dict:
     """
     Generates the QR code for one newly created record.

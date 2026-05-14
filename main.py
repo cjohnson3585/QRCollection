@@ -463,6 +463,86 @@ def get_request_base_url(request: Request) -> str:
     return str(request.base_url).strip().rstrip("/")
 
 
+def safe_unlink_under_directory(base_dir: Path, filename: str) -> bool:
+    """
+    Deletes a file only if it resolves inside the expected directory.
+
+    This prevents accidentally deleting arbitrary files if a bad filename is stored
+    in the database.
+    """
+    filename = str(filename or "").strip()
+
+    if not filename:
+        return False
+
+    base_dir = Path(base_dir).resolve()
+    target_path = (base_dir / filename).resolve()
+
+    try:
+        target_path.relative_to(base_dir)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Refusing to delete file outside allowed directory: {filename}",
+        )
+
+    if target_path.exists() and target_path.is_file():
+        target_path.unlink()
+        return True
+
+    return False
+
+
+def delete_record_files(item: sqlite3.Row) -> list[str]:
+    """
+    Deletes local files associated with a record:
+    - raw image from raw_images/
+    - QR code from output_qr_codes/
+    - compatibility showcase HTML from output_html/
+    """
+    deleted_files = []
+
+    object_slug = safe_value(item, "object_slug")
+    image_filename = safe_value(item, "image_filename")
+
+    if image_filename:
+        deleted = safe_unlink_under_directory(RAW_IMAGES_DIR, image_filename)
+        if deleted:
+            deleted_files.append(str(RAW_IMAGES_DIR / image_filename))
+
+    qr_filename = f"{object_slug}_qr.png"
+    if safe_unlink_under_directory(QR_CODES_DIR, qr_filename):
+        deleted_files.append(str(QR_CODES_DIR / qr_filename))
+
+    showcase_filename = f"{object_slug}_showcase.html"
+    if safe_unlink_under_directory(OUTPUT_HTML_DIR, showcase_filename):
+        deleted_files.append(str(OUTPUT_HTML_DIR / showcase_filename))
+
+    return deleted_files
+
+
+def delete_record_from_database(object_slug: str) -> None:
+    conn = get_db_connection()
+
+    try:
+        conn.execute(
+            """
+            DELETE FROM collection_items
+            WHERE object_slug = ?
+            """,
+            (object_slug,),
+        )
+        conn.commit()
+    except sqlite3.Error as exc:
+        conn.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to delete record from database: {exc}",
+        )
+    finally:
+        conn.close()
+
+
 def base_css() -> str:
     return """
         body {
@@ -556,7 +636,8 @@ def base_css() -> str:
             margin-bottom: 28px;
         }
 
-        .edit-button {
+        .edit-button,
+        .danger-link-button {
             display: inline-block;
             margin-right: 8px;
             margin-bottom: 28px;
@@ -571,6 +652,15 @@ def base_css() -> str:
 
         .edit-button:hover {
             background-color: #3b3025;
+        }
+
+        .danger-link-button {
+            background-color: #8a2f20;
+            border-color: #b56b5d;
+        }
+
+        .danger-link-button:hover {
+            background-color: #6f2418;
         }
 
         .info-grid {
@@ -606,6 +696,21 @@ def base_css() -> str:
         .description-box p {
             margin-bottom: 0;
             line-height: 1.7;
+        }
+
+        .warning-box {
+            margin-top: 20px;
+            padding: 20px;
+            background-color: #fff3ef;
+            border-left: 5px solid #8a2f20;
+            border-radius: 8px;
+            color: #4b241d;
+            line-height: 1.6;
+        }
+
+        .warning-box h3 {
+            margin-top: 0;
+            color: #8a2f20;
         }
 
         .form-grid {
@@ -647,7 +752,8 @@ def base_css() -> str:
         }
 
         button,
-        .cancel-button {
+        .cancel-button,
+        .delete-button {
             display: inline-block;
             padding: 10px 16px;
             background-color: #4b3b2a;
@@ -662,6 +768,15 @@ def base_css() -> str:
         button:hover,
         .cancel-button:hover {
             background-color: #3b3025;
+        }
+
+        .delete-button {
+            background-color: #8a2f20;
+            border-color: #b56b5d;
+        }
+
+        .delete-button:hover {
+            background-color: #6f2418;
         }
 
         footer {
@@ -1179,6 +1294,7 @@ def render_item_page(item: sqlite3.Row) -> str:
                 <a class="edit-button" href="{qr_url}" target="_blank" rel="noopener noreferrer">Open QR Code</a>
                 <a class="edit-button" href="{qr_url}" download>Download QR Code</a>
                 <a class="edit-button" href="/">Back to All Records</a>
+                <a class="danger-link-button" href="/admin/delete/{object_slug}">Delete Record</a>
 
                 <div class="info-grid">
                     <div class="label">Object ID</div>
@@ -1216,6 +1332,109 @@ def render_item_page(item: sqlite3.Row) -> str:
                     <h3>Description</h3>
                     <p>{html_escape(description)}</p>
                 </div>
+            </div>
+        </div>
+    </div>
+
+    <footer>
+        Historic Costume and Textiles Collection · Mississippi State University · Collection Access Page
+    </footer>
+
+</body>
+</html>
+"""
+
+
+def render_delete_confirm_page(item: sqlite3.Row) -> str:
+    object_slug = safe_value(item, "object_slug")
+    object_id = safe_value(item, "OBJECTID", object_slug)
+    object_name = safe_value(item, "OBJNAME")
+    item_date = safe_value(item, "DATE")
+    accession_no = safe_value(item, "ACCESSNO")
+    image_filename = safe_value(item, "image_filename")
+
+    image_block = render_image_block(image_filename, object_id)
+    qr_filename = f"{object_slug}_qr.png"
+    showcase_filename = f"{object_slug}_showcase.html"
+
+    return f"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Confirm Delete - {html_escape(object_id)}</title>
+    <style>{base_css()}</style>
+</head>
+<body>
+
+    <header>
+        <h1>Historic Costume and Textiles Collection</h1>
+        <p>Confirm Record Deletion</p>
+    </header>
+
+    <div class="container">
+        <div class="content">
+            <div class="image-section">
+                {image_block}
+            </div>
+
+            <div class="details-section">
+                <h2 class="item-title">Confirm Deletion</h2>
+                <div class="item-subtitle">
+                    {html_escape(object_id)} · {html_escape(object_name)} · {html_escape(item_date)}
+                </div>
+
+                <div class="warning-box">
+                    <h3>Confirm deletion</h3>
+                    <p>
+                        This will permanently remove this record from <strong>qr_collection.db</strong>.
+                        It will also delete the associated image file, QR code PNG, and generated showcase HTML
+                        if they exist.
+                    </p>
+                    <p>
+                        This action cannot be undone.
+                    </p>
+                </div>
+
+                <div class="info-grid" style="margin-top: 24px;">
+                    <div class="label">Object ID</div>
+                    <div class="value">{html_escape(object_id)}</div>
+
+                    <div class="label">Accession No.</div>
+                    <div class="value">{html_escape(accession_no)}</div>
+
+                    <div class="label">Object Slug</div>
+                    <div class="value">{html_escape(object_slug)}</div>
+
+                    <div class="label">Image File</div>
+                    <div class="value">{html_escape(image_filename) if image_filename else "No image assigned"}</div>
+
+                    <div class="label">QR Code File</div>
+                    <div class="value">{html_escape(qr_filename)}</div>
+
+                    <div class="label">Showcase HTML</div>
+                    <div class="value">{html_escape(showcase_filename)}</div>
+                </div>
+
+                <form
+                    method="post"
+                    action="/admin/delete/{object_slug}"
+                    onsubmit="return confirm('Confirm deletion: permanently delete this record, its image, QR code, and generated HTML?');"
+                >
+                    <div class="button-row">
+                        <button class="delete-button" type="submit">
+                            Confirm Delete Record
+                        </button>
+
+                        <a class="cancel-button" href="/item/{object_slug}">
+                            Cancel
+                        </a>
+
+                        <a class="cancel-button" href="/">
+                            Back to All Records
+                        </a>
+                    </div>
+                </form>
             </div>
         </div>
     </div>
@@ -1309,6 +1528,7 @@ def render_edit_page(item: sqlite3.Row) -> str:
                         <button type="submit">Save Changes</button>
                         <a class="cancel-button" href="/item/{object_slug}">Cancel</a>
                         <a class="cancel-button" href="/">Back to All Records</a>
+                        <a class="delete-button" href="/admin/delete/{object_slug}">Delete Record</a>
                     </div>
                 </form>
             </div>
@@ -1728,6 +1948,8 @@ async def update_item(
     update_columns = []
     update_values = []
 
+    old_image_filename = safe_value(item, "image_filename")
+
     for column in editable_columns:
         if column == "image_filename":
             continue
@@ -1739,6 +1961,9 @@ async def update_item(
         saved_image_filename = save_uploaded_image(uploaded_image, object_slug)
         update_columns.append('"image_filename" = ?')
         update_values.append(saved_image_filename)
+
+        if old_image_filename and old_image_filename != saved_image_filename:
+            safe_unlink_under_directory(RAW_IMAGES_DIR, old_image_filename)
     else:
         if "image_filename" in editable_columns:
             update_columns.append('"image_filename" = ?')
@@ -1850,6 +2075,47 @@ async def create_item(
         )
 
     return RedirectResponse(url=f"/item/{object_slug}", status_code=303)
+
+
+@app.get("/admin/delete/{object_slug}", response_class=HTMLResponse)
+def delete_item_confirm_page(
+    object_slug: str,
+    admin_user=Depends(require_admin),
+):
+    item = get_item_by_slug(object_slug)
+
+    if not item:
+        raise HTTPException(status_code=404, detail="Collection item not found")
+
+    return HTMLResponse(render_delete_confirm_page(item))
+
+
+@app.post("/admin/delete/{object_slug}")
+def delete_item(
+    object_slug: str,
+    admin_user=Depends(require_admin),
+):
+    item = get_item_by_slug(object_slug)
+
+    if not item:
+        raise HTTPException(status_code=404, detail="Collection item not found")
+
+    # Delete from the database first. If this fails, files are not touched.
+    delete_record_from_database(object_slug)
+
+    # Then remove associated local assets.
+    try:
+        delete_record_files(item)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Record was deleted from the database, but one or more associated files "
+                f"could not be deleted: {exc}"
+            ),
+        )
+
+    return RedirectResponse(url="/", status_code=303)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 from pathlib import Path
 import math
 import os
+import re
 import secrets
 import shutil
 import sqlite3
@@ -26,8 +27,6 @@ ADMIN_PASSWORD = os.getenv("QR_ADMIN_PASSWORD", "admin321")
 DEFAULT_PER_PAGE = 25
 MAX_PER_PAGE = 100
 
-# Columns searched by the homepage filter. These names match the raw Excel
-# column names used by bulk_qr_code_generator.py.
 SEARCH_COLUMNS = [
     "OBJECTID",
     "ACCESSNO",
@@ -60,9 +59,6 @@ app.mount(
 
 
 def quote_identifier(name: str) -> str:
-    """
-    Safely quote a SQLite identifier while preserving raw Excel column names.
-    """
     safe_name = str(name).replace('"', '""')
     return f'"{safe_name}"'
 
@@ -144,13 +140,6 @@ def get_available_columns() -> set[str]:
 
 
 def build_home_where_clause(search_query: str, available_columns: set[str]) -> tuple[str, list[str]]:
-    """
-    Builds a safe WHERE clause for homepage filtering.
-
-    The filter searches across common collection columns when those columns exist.
-    It does not interpolate user input into SQL. User input is always passed as a
-    bound parameter.
-    """
     search_query = (search_query or "").strip()
 
     if not search_query:
@@ -168,13 +157,11 @@ def build_home_where_clause(search_query: str, available_columns: set[str]) -> t
     return f"WHERE {' OR '.join(conditions)}", params
 
 
-def get_home_items(search_query: str = "", page: int = 1, per_page: int = DEFAULT_PER_PAGE) -> tuple[list[sqlite3.Row], int]:
-    """
-    Returns one page of homepage records plus the total number of matching rows.
-
-    This avoids loading the full collection into memory and keeps the homepage
-    usable even when the database grows very large.
-    """
+def get_home_items(
+    search_query: str = "",
+    page: int = 1,
+    per_page: int = DEFAULT_PER_PAGE,
+) -> tuple[list[sqlite3.Row], int]:
     page = clamp_page(page)
     per_page = clamp_per_page(per_page)
     offset = (page - 1) * per_page
@@ -244,6 +231,60 @@ def get_editable_columns():
     ]
 
     return editable_columns
+
+
+def slugify(value: str) -> str:
+    value = str(value or "").strip().lower()
+    value = re.sub(r"[^a-z0-9]+", "_", value)
+    value = re.sub(r"_+", "_", value)
+    value = value.strip("_")
+    return value
+
+
+def build_base_slug_from_form(form_data) -> str:
+    """
+    Creates a usable object_slug for a new record.
+
+    Preference order:
+    1. OBJECTID
+    2. ACCESSNO
+    3. OBJNAME
+    4. generated record token
+    """
+    for column in ["OBJECTID", "ACCESSNO", "OBJNAME"]:
+        value = str(form_data.get(column, "")).strip()
+        slug = slugify(value)
+        if slug:
+            return slug
+
+    return f"record_{secrets.token_hex(4)}"
+
+
+def make_unique_object_slug(base_slug: str) -> str:
+    base_slug = slugify(base_slug) or f"record_{secrets.token_hex(4)}"
+
+    conn = get_db_connection()
+
+    candidate = base_slug
+    counter = 2
+
+    while True:
+        existing = conn.execute(
+            """
+            SELECT 1
+            FROM collection_items
+            WHERE object_slug = ?
+            LIMIT 1
+            """,
+            (candidate,),
+        ).fetchone()
+
+        if not existing:
+            conn.close()
+            return candidate
+
+        candidate = f"{base_slug}_{counter}"
+        counter += 1
 
 
 def base_css() -> str:
@@ -494,9 +535,6 @@ def render_image_block(image_filename: str, object_id: str) -> str:
 
 
 def save_uploaded_image(uploaded_file: UploadFile, object_slug: str) -> str:
-    """
-    Saves an uploaded image to raw_images/ and returns the saved filename.
-    """
     if not uploaded_file or not uploaded_file.filename:
         return ""
 
@@ -669,6 +707,15 @@ def render_home_table(
             overflow-x: auto;
         }}
 
+        .records-header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            gap: 18px;
+            margin-bottom: 8px;
+            flex-wrap: wrap;
+        }}
+
         .records-title {{
             margin-top: 0;
             margin-bottom: 8px;
@@ -680,6 +727,22 @@ def render_home_table(
             font-size: 18px;
             color: #7a6a58;
             margin-bottom: 28px;
+        }}
+
+        .create-record-button {{
+            display: inline-block;
+            padding: 11px 16px;
+            background-color: #4b3b2a;
+            color: white;
+            text-decoration: none;
+            border-radius: 8px;
+            font-size: 14px;
+            border: 1px solid #b89b72;
+            white-space: nowrap;
+        }}
+
+        .create-record-button:hover {{
+            background-color: #3b3025;
         }}
 
         .filter-form {{
@@ -834,9 +897,17 @@ def render_home_table(
 
     <div class="container">
         <div class="table-container">
-            <h2 class="records-title">All Collection Records</h2>
-            <div class="records-subtitle">
-                Search records, view image thumbnails, open record pages, or download QR codes.
+            <div class="records-header">
+                <div>
+                    <h2 class="records-title">All Collection Records</h2>
+                    <div class="records-subtitle">
+                        Search records, view image thumbnails, open record pages, or download QR codes.
+                    </div>
+                </div>
+
+                <a class="create-record-button" href="/admin/create">
+                    Create New Record
+                </a>
             </div>
 
             <form class="filter-form" method="get" action="/">
@@ -1092,6 +1163,97 @@ def render_edit_page(item: sqlite3.Row) -> str:
 """
 
 
+def render_create_page() -> str:
+    editable_columns = get_editable_columns()
+
+    form_fields_html = ""
+
+    for column in editable_columns:
+        if column == "DESCRIP":
+            form_fields_html += f"""
+                <label for="{html_escape(column)}">{html_escape(column)}</label>
+                <textarea id="{html_escape(column)}" name="{html_escape(column)}"></textarea>
+            """
+        else:
+            form_fields_html += f"""
+                <label for="{html_escape(column)}">{html_escape(column)}</label>
+                <input id="{html_escape(column)}" name="{html_escape(column)}" value="">
+            """
+
+    image_block = render_image_block("", "New Record")
+
+    image_upload_html = """
+        <div class="description-box">
+            <h3>Image Upload</h3>
+            <p>
+                Current image filename:
+                <strong>No image assigned yet</strong>
+            </p>
+
+            <label for="uploaded_image">Upload Image</label>
+            <input
+                id="uploaded_image"
+                name="uploaded_image"
+                type="file"
+                accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp"
+            >
+        </div>
+    """
+
+    return f"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Create New Record</title>
+    <style>{base_css()}</style>
+</head>
+<body>
+
+    <header>
+        <h1>Historic Costume and Textiles Collection</h1>
+        <p>Create QR Collection Object Record</p>
+    </header>
+
+    <div class="container">
+        <div class="content">
+            <div class="image-section">
+                {image_block}
+            </div>
+
+            <div class="details-section">
+                <h2 class="item-title">Create New Record</h2>
+                <div class="item-subtitle">
+                    Enter the collection item details below. The record will be saved to qr_collection.db.
+                </div>
+
+                <form method="post" action="/admin/create" enctype="multipart/form-data">
+                    <div class="form-grid">
+                        {form_fields_html}
+                    </div>
+
+                    {image_upload_html}
+
+                    <div class="button-row">
+                        <button type="submit">Create Record</button>
+                        <a class="cancel-button" href="/">Cancel</a>
+                        <a class="cancel-button" href="/">Back to All Records</a>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <footer>
+        Historic Costume and Textiles Collection · Mississippi State University · Collection Access Page
+    </footer>
+
+</body>
+</html>
+"""
+
+
 @app.get("/", response_class=HTMLResponse)
 def index(
     q: str = Query("", description="Search/filter text"),
@@ -1107,7 +1269,6 @@ def index(
         per_page=per_page,
     )
 
-    # If the user lands beyond the last page after filtering, redirect to the last valid page.
     total_pages = max(1, math.ceil(total_count / per_page))
     if page > total_pages:
         return RedirectResponse(
@@ -1183,7 +1344,6 @@ async def update_item(
     update_values = []
 
     for column in editable_columns:
-        # uploaded_image is handled separately.
         if column == "image_filename":
             continue
 
@@ -1195,8 +1355,6 @@ async def update_item(
         update_columns.append('"image_filename" = ?')
         update_values.append(saved_image_filename)
     else:
-        # Keep whatever image_filename was manually typed in the edit form.
-        # This lets you still edit the filename by hand if desired.
         if "image_filename" in editable_columns:
             update_columns.append('"image_filename" = ?')
             update_values.append(str(form_data.get("image_filename", "")))
@@ -1214,6 +1372,61 @@ async def update_item(
 
     conn = get_db_connection()
     conn.execute(update_sql, update_values)
+    conn.commit()
+    conn.close()
+
+    return RedirectResponse(url=f"/item/{object_slug}", status_code=303)
+
+
+@app.get("/admin/create", response_class=HTMLResponse)
+def create_item_page(
+    admin_user=Depends(require_admin),
+):
+    return HTMLResponse(render_create_page())
+
+
+@app.post("/admin/create")
+async def create_item(
+    request: Request,
+    uploaded_image: Optional[UploadFile] = File(None),
+    admin_user=Depends(require_admin),
+):
+    editable_columns = get_editable_columns()
+    form_data = await request.form()
+
+    base_slug = build_base_slug_from_form(form_data)
+    object_slug = make_unique_object_slug(base_slug)
+
+    insert_columns = ["object_slug"]
+    insert_values = [object_slug]
+
+    for column in editable_columns:
+        if column == "image_filename":
+            continue
+
+        insert_columns.append(column)
+        insert_values.append(str(form_data.get(column, "")))
+
+    if "image_filename" in editable_columns:
+        if uploaded_image and uploaded_image.filename:
+            saved_image_filename = save_uploaded_image(uploaded_image, object_slug)
+            image_filename_value = saved_image_filename
+        else:
+            image_filename_value = str(form_data.get("image_filename", ""))
+
+        insert_columns.append("image_filename")
+        insert_values.append(image_filename_value)
+
+    placeholders = ", ".join(["?" for _ in insert_columns])
+    quoted_columns = ", ".join([quote_identifier(column) for column in insert_columns])
+
+    insert_sql = f"""
+        INSERT INTO collection_items ({quoted_columns})
+        VALUES ({placeholders})
+    """
+
+    conn = get_db_connection()
+    conn.execute(insert_sql, insert_values)
     conn.commit()
     conn.close()
 

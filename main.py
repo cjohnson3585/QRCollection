@@ -14,6 +14,8 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 
+from qr_code_generator import generate_qr_code_for_record
+
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -24,6 +26,10 @@ QR_CODES_DIR = BASE_DIR / "output_qr_codes"
 
 ADMIN_USERNAME = os.getenv("QR_ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.getenv("QR_ADMIN_PASSWORD", "admin321")
+
+# Set this on EC2 if you want QR codes to use your public URL:
+# export QR_BASE_URL="http://23.20.253.156:8000"
+QR_BASE_URL = os.getenv("QR_BASE_URL", "").strip().rstrip("/")
 
 DEFAULT_PER_PAGE = 25
 MAX_PER_PAGE = 100
@@ -157,9 +163,7 @@ def html_escape(value: str) -> str:
 
 
 def clamp_page(value: int) -> int:
-    if value < 1:
-        return 1
-    return value
+    return max(1, value)
 
 
 def clamp_per_page(value: int) -> int:
@@ -172,13 +176,8 @@ def clamp_per_page(value: int) -> int:
 
 def get_available_columns() -> set[str]:
     conn = get_db_connection()
-    columns = conn.execute(
-        """
-        PRAGMA table_info(collection_items)
-        """
-    ).fetchall()
+    columns = conn.execute("PRAGMA table_info(collection_items)").fetchall()
     conn.close()
-
     return {col["name"] for col in columns}
 
 
@@ -252,36 +251,28 @@ def get_item_by_slug(object_slug: str):
         (object_slug,),
     ).fetchone()
     conn.close()
-
     return item
 
 
 def get_editable_columns():
     conn = get_db_connection()
-    columns = conn.execute(
-        """
-        PRAGMA table_info(collection_items)
-        """
-    ).fetchall()
+    columns = conn.execute("PRAGMA table_info(collection_items)").fetchall()
     conn.close()
 
     excluded = {"id", "object_slug"}
 
-    editable_columns = [
+    return [
         col["name"]
         for col in columns
         if col["name"] not in excluded
     ]
-
-    return editable_columns
 
 
 def slugify(value: str) -> str:
     value = str(value or "").strip().lower()
     value = re.sub(r"[^a-z0-9]+", "_", value)
     value = re.sub(r"_+", "_", value)
-    value = value.strip("_")
-    return value
+    return value.strip("_")
 
 
 def build_base_slug_from_form(form_data) -> str:
@@ -323,19 +314,10 @@ def make_unique_object_slug(base_slug: str) -> str:
 
 def normalize_object_id_prefix(prefix: str) -> str:
     prefix = str(prefix or "").strip().upper()
-    prefix = re.sub(r"\s+", " ", prefix)
-    return prefix
+    return re.sub(r"\s+", " ", prefix)
 
 
 def get_object_id_number_from_value(object_id: str, prefix: str) -> Optional[int]:
-    """
-    Parses OBJECTID values like:
-    302 C-0007
-    302 C-0007a
-    302 C-0007ab
-
-    Returns the numeric part only.
-    """
     object_id = str(object_id or "").strip().upper()
     prefix = normalize_object_id_prefix(prefix)
 
@@ -349,13 +331,6 @@ def get_object_id_number_from_value(object_id: str, prefix: str) -> Optional[int
 
 
 def get_next_object_id_number(prefix: str) -> int:
-    """
-    Finds the highest existing numeric value for a given OBJECTID prefix and
-    returns the next number.
-
-    Example:
-    Existing 302 C-0000 through 302 C-0008 -> returns 9.
-    """
     prefix = normalize_object_id_prefix(prefix)
 
     if prefix not in OBJECT_ID_PREFIXES:
@@ -473,6 +448,19 @@ def get_object_id_prefix_defaults() -> dict[str, dict[str, object]]:
         }
 
     return defaults
+
+
+def get_request_base_url(request: Request) -> str:
+    """
+    Uses QR_BASE_URL when set. Otherwise uses the current request's base URL.
+
+    On EC2, set QR_BASE_URL to your public app URL so printed/scanned QR codes
+    do not point to localhost or an internal hostname.
+    """
+    if QR_BASE_URL:
+        return QR_BASE_URL
+
+    return str(request.base_url).strip().rstrip("/")
 
 
 def base_css() -> str:
@@ -885,7 +873,6 @@ def render_home_table(
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>QR Collection - All Records</title>
     <style>
         {base_css()}
@@ -956,10 +943,6 @@ def render_home_table(
             color: #4b3b2a;
             font-weight: bold;
             text-decoration: none;
-        }}
-
-        .clear-link:hover {{
-            text-decoration: underline;
         }}
 
         .pagination-row {{
@@ -1054,11 +1037,6 @@ def render_home_table(
             margin-top: 3px;
             margin-bottom: 3px;
             font-size: 13px;
-        }}
-
-        .record-link:hover,
-        .download-link:hover {{
-            text-decoration: underline;
         }}
 
         .small-url {{
@@ -1170,13 +1148,13 @@ def render_item_page(item: sqlite3.Row) -> str:
     image_filename = safe_value(item, "image_filename")
 
     image_block = render_image_block(image_filename, object_id)
+    qr_url = f"/qr_codes/{object_slug}_qr.png"
 
     return f"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>QR Collection - {html_escape(object_id)}</title>
     <style>{base_css()}</style>
 </head>
@@ -1197,13 +1175,10 @@ def render_item_page(item: sqlite3.Row) -> str:
                 <h2 class="item-title">{html_escape(object_id)}</h2>
                 <div class="item-subtitle">{html_escape(object_name)} · {html_escape(item_date)}</div>
 
-                <a class="edit-button" href="/admin/edit/{object_slug}">
-                    Edit this Record
-                </a>
-
-                <a class="edit-button" href="/">
-                    Back to All Records
-                </a>
+                <a class="edit-button" href="/admin/edit/{object_slug}">Edit this Record</a>
+                <a class="edit-button" href="{qr_url}" target="_blank" rel="noopener noreferrer">Open QR Code</a>
+                <a class="edit-button" href="{qr_url}" download>Download QR Code</a>
+                <a class="edit-button" href="/">Back to All Records</a>
 
                 <div class="info-grid">
                     <div class="label">Object ID</div>
@@ -1262,7 +1237,6 @@ def render_edit_page(item: sqlite3.Row) -> str:
     image_filename = safe_value(item, "image_filename")
 
     editable_columns = get_editable_columns()
-
     form_fields_html = ""
 
     for column in editable_columns:
@@ -1304,7 +1278,6 @@ def render_edit_page(item: sqlite3.Row) -> str:
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Edit Record - {html_escape(object_id)}</title>
     <style>{base_css()}</style>
 </head>
@@ -1416,8 +1389,7 @@ def render_create_object_id_builder() -> str:
             </div>
 
             <div id="object_id_help" class="helper-text">
-                You may keep the suggested number or enter a larger custom number. You cannot use a number
-                lower than the current next available number for the selected prefix.
+                You may keep the suggested number or enter a larger custom number.
             </div>
         </div>
 
@@ -1515,7 +1487,6 @@ def render_create_object_id_builder() -> str:
 
 def render_create_page() -> str:
     editable_columns = get_editable_columns()
-
     form_fields_html = ""
 
     for column in editable_columns:
@@ -1559,7 +1530,6 @@ def render_create_page() -> str:
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Create New Record</title>
     <style>
         {base_css()}
@@ -1850,9 +1820,34 @@ async def create_item(
     """
 
     conn = get_db_connection()
-    conn.execute(insert_sql, insert_values)
-    conn.commit()
-    conn.close()
+
+    try:
+        conn.execute(insert_sql, insert_values)
+        conn.commit()
+    except sqlite3.Error as exc:
+        conn.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to create record in database: {exc}",
+        )
+    finally:
+        conn.close()
+
+    try:
+        generate_qr_code_for_record(
+            object_slug=object_slug,
+            base_url=get_request_base_url(request),
+            output_qr_dir=QR_CODES_DIR,
+            output_html_dir=OUTPUT_HTML_DIR,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Record was created, but QR code generation failed for "
+                f"{generated_object_id}: {exc}"
+            ),
+        )
 
     return RedirectResponse(url=f"/item/{object_slug}", status_code=303)
 
